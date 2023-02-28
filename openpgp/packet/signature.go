@@ -73,15 +73,15 @@ type Signature struct {
 	IsPrimaryId                                             *bool
 	Notations                                               []*Notation
 
-	// TrustLevel and TrustAmount can be set by the signer to assert that 
-	// the key is not only valid but also trustworthy at the specified 
-	// level. 
-	// See RFC 4880, section 5.2.3.13 for details. 
-	TrustLevel TrustLevel
+	// TrustLevel and TrustAmount can be set by the signer to assert that
+	// the key is not only valid but also trustworthy at the specified
+	// level.
+	// See RFC 4880, section 5.2.3.13 for details.
+	TrustLevel  TrustLevel
 	TrustAmount TrustAmount
 
 	// TrustRegularExpression can be used in conjunction with trust Signature
-	// packets to limit the scope of the trust that is extended. 
+	// packets to limit the scope of the trust that is extended.
 	// See RFC 4880, section 5.2.3.14 for details.
 	TrustRegularExpression *string
 
@@ -114,20 +114,41 @@ type Signature struct {
 }
 
 func (sig *Signature) parse(r io.Reader) (err error) {
-	// RFC 4880, section 5.2.3
+	// RFC 4880, section 5.2.2 / 5.2.3
 	var buf [5]byte
 	_, err = readFull(r, buf[:1])
 	if err != nil {
 		return
 	}
-	if buf[0] != 4 && buf[0] != 5 {
+	if buf[0] != 3 && buf[0] != 4 && buf[0] != 5 {
 		err = errors.UnsupportedError("signature packet version " + strconv.Itoa(int(buf[0])))
 		return
 	}
 	sig.Version = int(buf[0])
-	_, err = readFull(r, buf[:5])
-	if err != nil {
-		return
+
+	if sig.Version == 3 {
+		// One-octet signature type
+		if _, err = readFull(r, buf[:1]); err != nil {
+			return
+		}
+		var tmp [8]byte
+		// Four-octet creation time
+		if _, err = readFull(r, tmp[:4]); err != nil {
+			return
+		}
+		// 8-octet key ID
+		if _, err = readFull(r, tmp[:8]); err != nil {
+			return
+		}
+		// One-octet public-key algorithm & one-octet hash algorithm
+		if _, err = readFull(r, buf[1:3]); err != nil {
+			return
+		}
+	} else {
+		_, err = readFull(r, buf[:5])
+		if err != nil {
+			return
+		}
 	}
 	sig.SigType = SignatureType(buf[0])
 	sig.PubKeyAlgo = PublicKeyAlgorithm(buf[1])
@@ -150,35 +171,38 @@ func (sig *Signature) parse(r io.Reader) (err error) {
 		return errors.UnsupportedError("hash function " + strconv.Itoa(int(buf[2])))
 	}
 
-	hashedSubpacketsLength := int(buf[3])<<8 | int(buf[4])
-	hashedSubpackets := make([]byte, hashedSubpacketsLength)
-	_, err = readFull(r, hashedSubpackets)
-	if err != nil {
-		return
-	}
-	err = sig.buildHashSuffix(hashedSubpackets)
-	if err != nil {
-		return
-	}
+	// v3 doesn't have subpackets
+	if sig.Version >= 4 {
+		hashedSubpacketsLength := int(buf[3])<<8 | int(buf[4])
+		hashedSubpackets := make([]byte, hashedSubpacketsLength)
+		_, err = readFull(r, hashedSubpackets)
+		if err != nil {
+			return
+		}
+		err = sig.buildHashSuffix(hashedSubpackets)
+		if err != nil {
+			return
+		}
 
-	err = parseSignatureSubpackets(sig, hashedSubpackets, true)
-	if err != nil {
-		return
-	}
+		err = parseSignatureSubpackets(sig, hashedSubpackets, true)
+		if err != nil {
+			return
+		}
 
-	_, err = readFull(r, buf[:2])
-	if err != nil {
-		return
-	}
-	unhashedSubpacketsLength := int(buf[0])<<8 | int(buf[1])
-	unhashedSubpackets := make([]byte, unhashedSubpacketsLength)
-	_, err = readFull(r, unhashedSubpackets)
-	if err != nil {
-		return
-	}
-	err = parseSignatureSubpackets(sig, unhashedSubpackets, false)
-	if err != nil {
-		return
+		_, err = readFull(r, buf[:2])
+		if err != nil {
+			return
+		}
+		unhashedSubpacketsLength := int(buf[0])<<8 | int(buf[1])
+		unhashedSubpackets := make([]byte, unhashedSubpacketsLength)
+		_, err = readFull(r, unhashedSubpackets)
+		if err != nil {
+			return
+		}
+		err = parseSignatureSubpackets(sig, unhashedSubpackets, false)
+		if err != nil {
+			return
+		}
 	}
 
 	_, err = readFull(r, sig.HashTag[:2])
@@ -372,16 +396,16 @@ func parseSignatureSubpacket(sig *Signature, subpacket []byte, isHashed bool) (r
 
 		nameLength := uint32(subpacket[4])<<8 | uint32(subpacket[5])
 		valueLength := uint32(subpacket[6])<<8 | uint32(subpacket[7])
-		if len(subpacket) != int(nameLength) + int(valueLength) + 8 {
+		if len(subpacket) != int(nameLength)+int(valueLength)+8 {
 			err = errors.StructuralError("notation data subpacket with bad length")
 			return
 		}
 
 		notation := Notation{
 			IsHumanReadable: (subpacket[0] & 0x80) == 0x80,
-			Name: string(subpacket[8: (nameLength + 8)]),
-			Value: subpacket[(nameLength + 8) : (valueLength + nameLength + 8)],
-			IsCritical: isCritical,
+			Name:            string(subpacket[8:(nameLength + 8)]),
+			Value:           subpacket[(nameLength + 8):(valueLength + nameLength + 8)],
+			IsCritical:      isCritical,
 		}
 
 		sig.Notations = append(sig.Notations, &notation)
@@ -493,14 +517,14 @@ func parseSignatureSubpacket(sig *Signature, subpacket []byte, isHashed bool) (r
 	case prefCipherSuitesSubpacket:
 		// Preferred AEAD cipher suites
 		// See https://www.ietf.org/archive/id/draft-ietf-openpgp-crypto-refresh-07.html#name-preferred-aead-ciphersuites
-		if len(subpacket) % 2 != 0 {
+		if len(subpacket)%2 != 0 {
 			err = errors.StructuralError("invalid aead cipher suite length")
 			return
 		}
 
-		sig.PreferredCipherSuites = make([][2]byte, len(subpacket) / 2)
+		sig.PreferredCipherSuites = make([][2]byte, len(subpacket)/2)
 
-		for i := 0; i < len(subpacket) / 2; i++ {
+		for i := 0; i < len(subpacket)/2; i++ {
 			sig.PreferredCipherSuites[i] = [2]uint8{subpacket[2*i], subpacket[2*i+1]}
 		}
 	default:
@@ -1039,7 +1063,7 @@ func (sig *Signature) AddMetadataToHashSuffix() {
 	n := sig.HashSuffix[len(sig.HashSuffix)-8:]
 	l := uint64(
 		uint64(n[0])<<56 | uint64(n[1])<<48 | uint64(n[2])<<40 | uint64(n[3])<<32 |
-		uint64(n[4])<<24 | uint64(n[5])<<16 | uint64(n[6])<<8 | uint64(n[7]))
+			uint64(n[4])<<24 | uint64(n[5])<<16 | uint64(n[6])<<8 | uint64(n[7]))
 
 	suffix := bytes.NewBuffer(nil)
 	suffix.Write(sig.HashSuffix[:l])
